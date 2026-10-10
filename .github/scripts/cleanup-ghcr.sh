@@ -1,59 +1,144 @@
-name: Clean up old GHCR packages
-
-# Keeps GHCR storage from growing without bound: every scheduled run keeps the
-# newest N versions of each macos-* package and deletes the rest. The GitHub
-# Release and tag of each deleted version are deleted too, and the entry is
-# removed from the `catalog` release, so no dead download links are left.
+#!/usr/bin/env bash
+# Delete old versions of this repository's GHCR packages, keeping the newest
+# KEEP versions of every package. Intended for a scheduled workflow.
 #
-# Deleting package versions needs the `delete:packages` scope, which the
-# workflow GITHUB_TOKEN does NOT have. Create a classic PAT with that scope and
-# store it as the GHCR_GC_TOKEN repository secret. Without the secret the job
-# only warns and does nothing.
+# When a package version is deleted, the GitHub Release (and its git tag) that
+# points to it is deleted too, and the entry is removed from the rolling
+# `catalog` release. This avoids dead one-liners that would 404.
 #
-# Releases and the catalog are handled with the workflow GITHUB_TOKEN, which is
-# why this workflow requests contents: write.
+# GITHUB_TOKEN cannot delete package versions, so this needs a token with the
+# `delete:packages` scope (a classic PAT) in the GHCR_GC_TOKEN secret.
+# Release and catalog changes use RELEASE_TOKEN (the workflow GITHUB_TOKEN with
+# contents: write). If RELEASE_TOKEN is unset, GH_TOKEN is used for both.
+#
+# Env:
+#   GH_TOKEN           (required) PAT with delete:packages
+#   RELEASE_TOKEN      token used for releases/catalog (default: GH_TOKEN)
+#   GITHUB_REPOSITORY  (required) owner/repo
+#   KEEP               versions to keep per package (default 5)
+#   DRY_RUN            "1" to only list what would be deleted (default 0)
+#   PACKAGE_PREFIX     only touch packages with this prefix (default macos-)
+set -euo pipefail
 
-on:
-  schedule:
-    - cron: '0 4 * * 0'   # every Sunday at 04:00 UTC
-  workflow_dispatch:
-    inputs:
-      keep:
-        description: 'How many newest versions to keep per package'
-        required: false
-        default: '5'
-      dry_run:
-        description: 'List what would be deleted (packages and releases) without deleting'
-        type: boolean
-        default: true
+: "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+: "${GH_TOKEN:?GH_TOKEN is required}"
+RELEASE_TOKEN=${RELEASE_TOKEN:-$GH_TOKEN}
+owner=${GITHUB_REPOSITORY%%/*}
+keep=${KEEP:-5}
+dry_run=${DRY_RUN:-0}
+prefix=${PACKAGE_PREFIX:-macos-}
 
-permissions:
-  contents: write
-  packages: write
+deleted_tags_file=$(mktemp)
+trap 'rm -f "$deleted_tags_file"' EXIT
 
-jobs:
-  cleanup:
-    runs-on: ubuntu-slim
-    timeout-minutes: 15
-    env:
-      GITHUB_REPOSITORY: ${{ github.repository }}
-      GH_TOKEN: ${{ secrets.GHCR_GC_TOKEN }}
-      RELEASE_TOKEN: ${{ github.token }}
-      KEEP: ${{ github.event.inputs.keep || '5' }}
-      # Scheduled runs delete; manual runs default to a dry run.
-      DRY_RUN: ${{ github.event_name == 'schedule' && '0' || (github.event.inputs.dry_run == 'false' && '0' || '1') }}
+# User packages and organization packages live under different endpoints.
+owner_type=$(gh api "/users/${owner}" --jq .type 2>/dev/null || echo User)
+if [ "$owner_type" = "Organization" ]; then
+    base="/orgs/${owner}/packages"
+else
+    base="/users/${owner}/packages"
+fi
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+echo "owner=${owner} type=${owner_type} keep=${keep} dry_run=${dry_run} prefix=${prefix}"
 
-      - name: Check for token
-        run: |
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "::warning::GHCR_GC_TOKEN secret is not set - skipping package cleanup. Add a classic PAT with the delete:packages scope to enable it."
-            echo "skip=1" >> "$GITHUB_ENV"
-          fi
+# Delete the GitHub Release and git tag that belong to a deleted package version.
+delete_release() {
+    local tag=$1
+    if [ "$dry_run" = "1" ]; then
+        echo "DRY-RUN release: would delete release and tag ${tag}"
+        return 0
+    fi
+    if GH_TOKEN="$RELEASE_TOKEN" gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+        if GH_TOKEN="$RELEASE_TOKEN" gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes >/dev/null 2>&1; then
+            echo "deleted release ${tag}"
+        else
+            echo "::warning::failed to delete release ${tag}" >&2
+        fi
+    else
+        echo "no release found for tag ${tag}"
+    fi
+}
 
-      - name: Delete old package versions and their releases
-        if: env.skip != '1'
-        run: bash .github/scripts/cleanup-ghcr.sh
+# Remove deleted tags from catalog.json in the rolling `catalog` release.
+update_catalog() {
+    [ "$dry_run" = "1" ] && return 0
+    [ -s "$deleted_tags_file" ] || return 0
+    (
+        export GH_TOKEN="$RELEASE_TOKEN"
+        dir=$(mktemp -d)
+        if ! gh release download catalog --repo "$GITHUB_REPOSITORY" \
+            --pattern catalog.json --dir "$dir" --clobber >/dev/null 2>&1; then
+            echo "no catalog release to update"
+            rm -rf "$dir"
+            exit 0
+        fi
+        gone=$(jq -R . "$deleted_tags_file" | jq -s .)
+        jq --argjson gone "$gone" \
+            '[ .[] | select(.tag as $t | ($gone | index($t)) | not) ]' \
+            "$dir/catalog.json" > "$dir/catalog.new.json"
+        mv "$dir/catalog.new.json" "$dir/catalog.json"
+        gh release upload catalog "$dir/catalog.json" --repo "$GITHUB_REPOSITORY" --clobber
+        echo "catalog updated"
+        rm -rf "$dir"
+    ) || echo "::warning::failed to update the 'catalog' release" >&2
+}
+
+packages=$(gh api --paginate "${base}?package_type=container&per_page=100" --jq '.[].name' 2>/dev/null || true)
+if [ -z "$packages" ]; then
+    echo "No container packages found (or the token lacks access)."
+    exit 0
+fi
+
+total_deleted=0
+for package in $packages; do
+    case "$package" in
+        "${prefix}"*) ;;
+        *) continue ;;
+    esac
+
+    # Newest first. Output: "<id><TAB><created_at><TAB><comma-separated tags>".
+    versions=$(gh api --paginate "${base}/container/${package}/versions?per_page=100" \
+        --jq 'sort_by(.created_at) | reverse | .[] | "\(.id)\t\(.created_at)\t\([.metadata.container.tags[]?] | join(","))"' 2>/dev/null || true)
+    [ -n "$versions" ] || { echo "${package}: no versions"; continue; }
+
+    count=0
+    kept=0
+    while IFS=$'\t' read -r version_id created_at tags; do
+        [ -n "$version_id" ] || continue
+        count=$((count + 1))
+        if [ "$count" -le "$keep" ]; then
+            kept=$((kept + 1))
+            continue
+        fi
+        if [ "$dry_run" = "1" ]; then
+            echo "DRY-RUN ${package}: would delete version ${version_id} (${created_at}) tags='${tags}'"
+            if [ -n "$tags" ]; then
+                IFS=',' read -ra tag_list <<< "$tags"
+                for t in "${tag_list[@]}"; do
+                    delete_release "$t"
+                done
+            fi
+        else
+            if gh api -X DELETE "${base}/container/${package}/versions/${version_id}" >/dev/null 2>&1; then
+                echo "deleted ${package}: version ${version_id} (${created_at}) tags='${tags}'"
+                total_deleted=$((total_deleted + 1))
+                # Only remove the release after the package version is really gone.
+                if [ -n "$tags" ]; then
+                    IFS=',' read -ra tag_list <<< "$tags"
+                    for t in "${tag_list[@]}"; do
+                        delete_release "$t"
+                        printf '%s\n' "$t" >> "$deleted_tags_file"
+                    done
+                fi
+            else
+                echo "::warning::failed to delete ${package} version ${version_id}" >&2
+            fi
+        fi
+    done <<< "$versions"
+
+    echo "${package}: ${count} version(s), kept ${kept} newest"
+done
+
+update_catalog
+
+echo "done (deleted=${total_deleted}, dry_run=${dry_run})"
