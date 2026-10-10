@@ -1,12 +1,17 @@
 name: Clean up old GHCR packages
 
 # Keeps GHCR storage from growing without bound: every scheduled run keeps the
-# newest N versions of each macos-* package and deletes the rest.
+# newest N versions of each macos-* package and deletes the rest. The GitHub
+# Release and tag of each deleted version are deleted too, and the entry is
+# removed from the `catalog` release, so no dead download links are left.
 #
 # Deleting package versions needs the `delete:packages` scope, which the
 # workflow GITHUB_TOKEN does NOT have. Create a classic PAT with that scope and
 # store it as the GHCR_GC_TOKEN repository secret. Without the secret the job
 # only warns and does nothing.
+#
+# Releases and the catalog are handled with the workflow GITHUB_TOKEN, which is
+# why this workflow requests contents: write.
 
 on:
   schedule:
@@ -18,12 +23,12 @@ on:
         required: false
         default: '5'
       dry_run:
-        description: 'List what would be deleted without deleting'
+        description: 'List what would be deleted (packages and releases) without deleting'
         type: boolean
         default: true
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -33,6 +38,7 @@ jobs:
     env:
       GITHUB_REPOSITORY: ${{ github.repository }}
       GH_TOKEN: ${{ secrets.GHCR_GC_TOKEN }}
+      RELEASE_TOKEN: ${{ github.token }}
       KEEP: ${{ github.event.inputs.keep || '5' }}
       # Scheduled runs delete; manual runs default to a dry run.
       DRY_RUN: ${{ github.event_name == 'schedule' && '0' || (github.event.inputs.dry_run == 'false' && '0' || '1') }}
@@ -48,6 +54,6 @@ jobs:
             echo "skip=1" >> "$GITHUB_ENV"
           fi
 
-      - name: Delete old package versions
+      - name: Delete old package versions and their releases
         if: env.skip != '1'
         run: bash .github/scripts/cleanup-ghcr.sh
